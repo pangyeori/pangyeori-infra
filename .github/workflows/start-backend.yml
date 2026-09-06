@@ -1,4 +1,4 @@
-name: Start Server
+name: Start Backend
 
 on:
   workflow_dispatch:

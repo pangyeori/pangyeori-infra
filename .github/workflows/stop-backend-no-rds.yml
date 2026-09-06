@@ -1,4 +1,4 @@
-name: Stop Server
+name: Stop Backend (RDS 제외)
 
 on:
   workflow_dispatch:
@@ -90,20 +90,6 @@ jobs:
             echo "Target Group 삭제 완료"
           else
             echo "Target Group 없음, 건너뜀"
-          fi
-
-      - name: RDS 중지
-        run: |
-          RDS_STATUS=$(aws rds describe-db-instances \
-            --db-instance-identifier "${{ vars.RDS_ID }}" \
-            --query "DBInstances[0].DBInstanceStatus" \
-            --output text)
-
-          if [ "$RDS_STATUS" = "available" ]; then
-            aws rds stop-db-instance --db-instance-identifier "${{ vars.RDS_ID }}" > /dev/null
-            echo "RDS 중지 완료"
-          else
-            echo "RDS 이미 중지 중, 건너뜀"
           fi
 
       - name: NAT Instance 중지
