@@ -142,13 +142,17 @@ jobs:
             echo "NAT Instance 이미 중지 중, 건너뜀"
           fi
 
+  notify:
+    needs: stop
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
       - name: Discord 알림
-        if: always()
         run: |
           TIME=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
-          if [ "${{ job.status }}" = "success" ]; then
+          if [ "${{ needs.stop.result }}" = "success" ]; then
             COLOR=3066993
             STATUS="✅ 성공"
             DESC="백엔드 서버가 정상적으로 중지됐습니다."
