@@ -221,3 +221,34 @@ jobs:
               sleep 10
             fi
           done
+
+      - name: Discord 알림
+        if: always()
+        run: |
+          TIME=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          if [ "${{ job.status }}" = "success" ]; then
+            COLOR=3066993
+            STATUS="✅ 성공"
+            DESC="백엔드 서버가 정상적으로 시작됐습니다."
+          else
+            COLOR=15158332
+            STATUS="❌ 실패"
+            DESC="백엔드 서버 시작에 실패했습니다."
+          fi
+
+          curl -s -H "Content-Type: application/json" \
+            -d "{
+              \"embeds\": [{
+                \"title\": \"$STATUS | Backend Up\",
+                \"description\": \"$DESC\",
+                \"color\": $COLOR,
+                \"fields\": [
+                  {\"name\": \"실행자\", \"value\": \"${{ github.actor }}\", \"inline\": true},
+                  {\"name\": \"시간\", \"value\": \"$TIME\", \"inline\": true},
+                  {\"name\": \"로그\", \"value\": \"[Actions 실행 보기]($RUN_URL)\", \"inline\": false}
+                ]
+              }]
+            }" \
+            "${{ secrets.DISCORD_WEBHOOK_URL }}" || true
