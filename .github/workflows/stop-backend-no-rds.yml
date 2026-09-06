@@ -135,7 +135,7 @@ jobs:
     steps:
       - name: Discord 알림
         run: |
-          TIME=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          TIME=$(TZ="Asia/Seoul" date +"%Y-%m-%d %H:%M:%S KST")
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
           if [ "${{ needs.stop.result }}" = "success" ]; then
