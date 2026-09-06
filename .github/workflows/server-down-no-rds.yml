@@ -1,0 +1,129 @@
+name: Stop Server (RDS 제외)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  stop:
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ap-northeast-2
+
+    steps:
+      - name: ECS Service 삭제
+        run: |
+          SVC_STATUS=$(aws ecs describe-services \
+            --cluster "${{ vars.CLUSTER }}" \
+            --services "${{ vars.SERVICE_NAME }}" \
+            --query "services[0].status" \
+            --output text 2>/dev/null || echo "")
+
+          if [ "$SVC_STATUS" = "ACTIVE" ]; then
+            aws ecs update-service \
+              --cluster "${{ vars.CLUSTER }}" \
+              --service "${{ vars.SERVICE_NAME }}" \
+              --desired-count 0 > /dev/null
+            aws ecs wait services-stable \
+              --cluster "${{ vars.CLUSTER }}" \
+              --services "${{ vars.SERVICE_NAME }}"
+            aws ecs delete-service \
+              --cluster "${{ vars.CLUSTER }}" \
+              --service "${{ vars.SERVICE_NAME }}" > /dev/null
+            echo "ECS Service 삭제 완료"
+          else
+            echo "ECS Service 없음, 건너뜀"
+          fi
+
+      - name: ElastiCache 중지
+        run: |
+          REDIS_STATUS=$(aws elasticache describe-serverless-caches \
+            --serverless-cache-name "${{ vars.REDIS_NAME }}" \
+            --query "ServerlessCaches[0].Status" \
+            --output text 2>/dev/null || echo "")
+
+          if [ "$REDIS_STATUS" = "available" ]; then
+            if aws elasticache stop-serverless-cache \
+              --serverless-cache-name "${{ vars.REDIS_NAME }}" > /dev/null 2>&1; then
+              echo "ElastiCache 중지 완료"
+            else
+              echo "ElastiCache stop API 미지원, 건너뜀"
+            fi
+          else
+            echo "ElastiCache 이미 중지 중, 건너뜀"
+          fi
+
+      - name: ALB 삭제
+        run: |
+          ALB_ARN=$(aws elbv2 describe-load-balancers \
+            --names "${{ vars.ALB_NAME }}" \
+            --query "LoadBalancers[0].LoadBalancerArn" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -n "$ALB_ARN" ] && [ "$ALB_ARN" != "None" ]; then
+            LISTENERS=$(aws elbv2 describe-listeners \
+              --load-balancer-arn "$ALB_ARN" \
+              --query "Listeners[*].ListenerArn" \
+              --output text)
+            for L in $LISTENERS; do
+              aws elbv2 delete-listener --listener-arn "$L" > /dev/null
+            done
+            echo "ALB Listener 삭제 완료"
+
+            aws elbv2 delete-load-balancer --load-balancer-arn "$ALB_ARN" > /dev/null
+            aws elbv2 wait load-balancers-deleted --load-balancer-arns "$ALB_ARN"
+            echo "ALB 삭제 완료"
+          else
+            echo "ALB 없음, 건너뜀"
+          fi
+
+      - name: Target Group 삭제
+        run: |
+          TG_ARN=$(aws elbv2 describe-target-groups \
+            --names "${{ vars.TG_NAME }}" \
+            --query "TargetGroups[0].TargetGroupArn" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -n "$TG_ARN" ] && [ "$TG_ARN" != "None" ]; then
+            aws elbv2 delete-target-group --target-group-arn "$TG_ARN" > /dev/null
+            echo "Target Group 삭제 완료"
+          else
+            echo "Target Group 없음, 건너뜀"
+          fi
+
+      - name: NAT Instance 중지
+        run: |
+          NAT_ID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=${{ vars.NAT_TAG }}" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query "Reservations[0].Instances[0].InstanceId" \
+            --output text)
+
+          NAT_STATUS=$(aws ec2 describe-instances \
+            --instance-ids "$NAT_ID" \
+            --query "Reservations[0].Instances[0].State.Name" \
+            --output text)
+
+          if [ "$NAT_STATUS" = "running" ]; then
+            aws ec2 stop-instances --instance-ids "$NAT_ID" > /dev/null
+            echo "NAT Instance 중지 완료"
+
+            NAT_EIP_ALLOC=$(aws ec2 describe-addresses \
+              --filters "Name=instance-id,Values=$NAT_ID" \
+              --query "Addresses[0].AllocationId" \
+              --output text)
+
+            if [ -n "$NAT_EIP_ALLOC" ] && [ "$NAT_EIP_ALLOC" != "None" ]; then
+              NAT_EIP_ASSOC=$(aws ec2 describe-addresses \
+                --filters "Name=instance-id,Values=$NAT_ID" \
+                --query "Addresses[0].AssociationId" \
+                --output text)
+              aws ec2 disassociate-address --association-id "$NAT_EIP_ASSOC" > /dev/null
+              aws ec2 release-address --allocation-id "$NAT_EIP_ALLOC" > /dev/null
+              echo "NAT Instance Elastic IP 반납 완료"
+            else
+              echo "NAT Instance에 연결된 Elastic IP 없음, 건너뜀"
+            fi
+          else
+            echo "NAT Instance 이미 중지 중, 건너뜀"
+          fi

@@ -1,0 +1,223 @@
+name: Start Server
+
+on:
+  workflow_dispatch:
+
+jobs:
+  start:
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ap-northeast-2
+
+    steps:
+      - name: NAT Instance ID 조회
+        run: |
+          NAT_ID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=${{ vars.NAT_TAG }}" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query "Reservations[0].Instances[0].InstanceId" \
+            --output text)
+          echo "NAT_ID=$NAT_ID" >> $GITHUB_ENV
+
+      - name: NAT Instance 시작
+        run: |
+          while true; do
+            NAT_STATUS=$(aws ec2 describe-instances \
+              --instance-ids "$NAT_ID" \
+              --query "Reservations[0].Instances[0].State.Name" \
+              --output text)
+            echo "NAT Instance 상태: $NAT_STATUS"
+
+            if [ "$NAT_STATUS" = "running" ]; then
+              break
+            elif [ "$NAT_STATUS" = "stopped" ]; then
+              aws ec2 start-instances --instance-ids "$NAT_ID" > /dev/null
+              aws ec2 wait instance-running --instance-ids "$NAT_ID"
+
+              NAT_EIP_ALLOC=$(aws ec2 allocate-address --domain vpc --query "AllocationId" --output text)
+              aws ec2 associate-address --instance-id "$NAT_ID" --allocation-id "$NAT_EIP_ALLOC" > /dev/null
+              echo "Elastic IP 할당 완료"
+              sleep 20
+              break
+            else
+              sleep 15
+            fi
+          done
+
+      - name: RDS 시작
+        run: |
+          while true; do
+            RDS_STATUS=$(aws rds describe-db-instances \
+              --db-instance-identifier "${{ vars.RDS_ID }}" \
+              --query "DBInstances[0].DBInstanceStatus" \
+              --output text)
+            echo "RDS 상태: $RDS_STATUS"
+
+            if [ "$RDS_STATUS" = "available" ]; then
+              break
+            elif [ "$RDS_STATUS" = "stopped" ]; then
+              aws rds start-db-instance --db-instance-identifier "${{ vars.RDS_ID }}" > /dev/null
+              aws rds wait db-instance-available --db-instance-identifier "${{ vars.RDS_ID }}"
+              echo "RDS 시작 완료"
+              break
+            else
+              sleep 15
+            fi
+          done
+
+      - name: ElastiCache 시작
+        run: |
+          REDIS_STATUS=$(aws elasticache describe-serverless-caches \
+            --serverless-cache-name "${{ vars.REDIS_NAME }}" \
+            --query "ServerlessCaches[0].Status" \
+            --output text)
+          echo "ElastiCache 상태: $REDIS_STATUS"
+
+          if [ "$REDIS_STATUS" != "available" ]; then
+            aws elasticache start-serverless-cache --serverless-cache-name "${{ vars.REDIS_NAME }}" > /dev/null
+            echo "ElastiCache 시작 완료"
+          fi
+
+      - name: Target Group 생성
+        run: |
+          TG_ARN=$(aws elbv2 describe-target-groups \
+            --names "${{ vars.TG_NAME }}" \
+            --query "TargetGroups[0].TargetGroupArn" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -z "$TG_ARN" ] || [ "$TG_ARN" = "None" ]; then
+            TG_ARN=$(aws elbv2 create-target-group \
+              --name "${{ vars.TG_NAME }}" \
+              --protocol HTTP \
+              --port ${{ vars.CONTAINER_PORT }} \
+              --vpc-id "${{ vars.VPC_ID }}" \
+              --target-type ip \
+              --ip-address-type ipv4 \
+              --protocol-version HTTP1 \
+              --health-check-protocol HTTP \
+              --health-check-port traffic-port \
+              --health-check-path /actuator/health \
+              --health-check-interval-seconds 30 \
+              --health-check-timeout-seconds 10 \
+              --healthy-threshold-count 2 \
+              --unhealthy-threshold-count 3 \
+              --matcher HttpCode=200 \
+              --query "TargetGroups[0].TargetGroupArn" \
+              --output text)
+            echo "Target Group 생성 완료: $TG_ARN"
+          else
+            echo "Target Group 이미 존재: $TG_ARN"
+          fi
+          echo "TG_ARN=$TG_ARN" >> $GITHUB_ENV
+
+      - name: ALB 생성
+        run: |
+          ALB_ARN=$(aws elbv2 describe-load-balancers \
+            --names "${{ vars.ALB_NAME }}" \
+            --query "LoadBalancers[0].LoadBalancerArn" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -z "$ALB_ARN" ] || [ "$ALB_ARN" = "None" ]; then
+            ALB_ARN=$(aws elbv2 create-load-balancer \
+              --name "${{ vars.ALB_NAME }}" \
+              --subnets "${{ vars.ALB_SUBNET_1 }}" "${{ vars.ALB_SUBNET_2 }}" \
+              --security-groups "${{ vars.ALB_SG }}" \
+              --scheme internet-facing \
+              --type application \
+              --ip-address-type ipv4 \
+              --query "LoadBalancers[0].LoadBalancerArn" \
+              --output text)
+            echo "ALB 생성 완료: $ALB_ARN"
+
+            aws elbv2 wait load-balancer-available --load-balancer-arns "$ALB_ARN"
+
+            aws elbv2 create-listener \
+              --load-balancer-arn "$ALB_ARN" \
+              --protocol HTTPS \
+              --port 443 \
+              --ssl-policy "${{ vars.SSL_POLICY }}" \
+              --certificates "CertificateArn=${{ secrets.CERT_ARN }}" \
+              --default-actions "Type=forward,TargetGroupArn=$TG_ARN" > /dev/null
+            echo "HTTPS Listener 생성 완료"
+
+            aws elbv2 create-listener \
+              --load-balancer-arn "$ALB_ARN" \
+              --protocol HTTP \
+              --port 80 \
+              --default-actions '[{"Type":"redirect","RedirectConfig":{"Protocol":"HTTPS","Port":"443","Host":"#{host}","Path":"/#{path}","Query":"#{query}","StatusCode":"HTTP_301"}}]' > /dev/null
+            echo "HTTP Listener 생성 완료"
+
+            ALB_DNS=$(aws elbv2 describe-load-balancers \
+              --load-balancer-arns "$ALB_ARN" \
+              --query "LoadBalancers[0].DNSName" \
+              --output text)
+            echo "새 ALB DNS: $ALB_DNS"
+
+            aws route53 change-resource-record-sets \
+              --hosted-zone-id "${{ secrets.HOSTED_ZONE_ID }}" \
+              --change-batch "{\"Changes\":[{\"Action\":\"UPSERT\",\"ResourceRecordSet\":{\"Name\":\"${{ vars.DNS_RECORD }}\",\"Type\":\"A\",\"AliasTarget\":{\"HostedZoneId\":\"${{ vars.ALB_HZ_ID }}\",\"DNSName\":\"dualstack.$ALB_DNS.\",\"EvaluateTargetHealth\":true}}}]}" > /dev/null
+            echo "Route 53 업데이트 완료"
+          else
+            echo "ALB 이미 존재: $ALB_ARN"
+          fi
+          echo "ALB_ARN=$ALB_ARN" >> $GITHUB_ENV
+
+      - name: ECS Service 시작
+        run: |
+          SVC_STATUS=$(aws ecs describe-services \
+            --cluster "${{ vars.CLUSTER }}" \
+            --services "${{ vars.SERVICE_NAME }}" \
+            --query "services[0].status" \
+            --output text 2>/dev/null || echo "")
+
+          if [ "$SVC_STATUS" = "ACTIVE" ]; then
+            echo "ECS Service 이미 존재, desired-count 1로 설정 중..."
+            aws ecs update-service \
+              --cluster "${{ vars.CLUSTER }}" \
+              --service "${{ vars.SERVICE_NAME }}" \
+              --desired-count 1 > /dev/null
+          else
+            echo "ECS Service 생성 중..."
+            aws ecs create-service \
+              --cluster "${{ vars.CLUSTER }}" \
+              --service-name "${{ vars.SERVICE_NAME }}" \
+              --task-definition "${{ vars.TASK_DEF }}" \
+              --desired-count 1 \
+              --capacity-provider-strategy "capacityProvider=FARGATE,weight=1,base=0" \
+              --network-configuration "awsvpcConfiguration={subnets=[${{ vars.ECS_SUBNET_1 }},${{ vars.ECS_SUBNET_2 }}],securityGroups=[${{ vars.ECS_SG }}],assignPublicIp=DISABLED}" \
+              --load-balancers "targetGroupArn=$TG_ARN,containerName=${{ vars.CONTAINER_NAME }},containerPort=${{ vars.CONTAINER_PORT }}" \
+              --health-check-grace-period-seconds 120 \
+              --scheduling-strategy REPLICA \
+              --deployment-configuration "deploymentCircuitBreaker={enable=true,rollback=true},maximumPercent=200,minimumHealthyPercent=100" \
+              --enable-ecs-managed-tags \
+              --availability-zone-rebalancing ENABLED > /dev/null
+            echo "ECS Service 생성 완료"
+          fi
+
+          aws ecs wait services-stable \
+            --cluster "${{ vars.CLUSTER }}" \
+            --services "${{ vars.SERVICE_NAME }}"
+          echo "ECS Service 안정화 완료"
+
+      - name: ALB 헬스체크
+        run: |
+          TG_ARN=$(aws elbv2 describe-target-groups \
+            --names "${{ vars.TG_NAME }}" \
+            --query "TargetGroups[0].TargetGroupArn" \
+            --output text)
+
+          while true; do
+            HEALTH=$(aws elbv2 describe-target-health \
+              --target-group-arn "$TG_ARN" \
+              --query "TargetHealthDescriptions[0].TargetHealth.State" \
+              --output text 2>/dev/null || echo "")
+
+            if [ "$HEALTH" = "healthy" ]; then
+              echo "ALB 헬스체크 통과 (현재 상태: healthy)"
+              break
+            else
+              echo "대기 중... (현재 상태: $HEALTH)"
+              sleep 10
+            fi
+          done
