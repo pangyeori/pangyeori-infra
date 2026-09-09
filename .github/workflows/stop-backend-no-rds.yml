@@ -36,7 +36,7 @@ jobs:
             echo "ECS Service 없음, 건너뜀"
           fi
 
-      - name: ElastiCache 중지
+      - name: ElastiCache 삭제
         run: |
           REDIS_STATUS=$(aws elasticache describe-serverless-caches \
             --serverless-cache-name "${{ vars.REDIS_NAME }}" \
@@ -44,14 +44,11 @@ jobs:
             --output text 2>/dev/null || echo "")
 
           if [ "$REDIS_STATUS" = "available" ]; then
-            if aws elasticache stop-serverless-cache \
-              --serverless-cache-name "${{ vars.REDIS_NAME }}" > /dev/null 2>&1; then
-              echo "ElastiCache 중지 완료"
-            else
-              echo "ElastiCache stop API 미지원, 건너뜀"
-            fi
+            aws elasticache delete-serverless-cache \
+              --serverless-cache-name "${{ vars.REDIS_NAME }}" > /dev/null
+            echo "ElastiCache 삭제 완료"
           else
-            echo "ElastiCache 이미 중지 중, 건너뜀"
+            echo "ElastiCache 없음, 건너뜀"
           fi
 
       - name: ALB 삭제

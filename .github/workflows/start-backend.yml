@@ -66,18 +66,48 @@ jobs:
             fi
           done
 
-      - name: ElastiCache 시작
+      - name: ElastiCache 생성
         run: |
           REDIS_STATUS=$(aws elasticache describe-serverless-caches \
             --serverless-cache-name "${{ vars.REDIS_NAME }}" \
             --query "ServerlessCaches[0].Status" \
-            --output text)
+            --output text 2>/dev/null || echo "")
           echo "ElastiCache 상태: $REDIS_STATUS"
 
-          if [ "$REDIS_STATUS" != "available" ]; then
-            aws elasticache start-serverless-cache --serverless-cache-name "${{ vars.REDIS_NAME }}" > /dev/null
-            echo "ElastiCache 시작 완료"
+          if [ "$REDIS_STATUS" = "available" ]; then
+            echo "ElastiCache 이미 존재"
+            REDIS_HOST=$(aws elasticache describe-serverless-caches \
+              --serverless-cache-name "${{ vars.REDIS_NAME }}" \
+              --query "ServerlessCaches[0].Endpoint.Address" \
+              --output text)
+          else
+            echo "ElastiCache 생성 중..."
+            aws elasticache create-serverless-cache \
+              --serverless-cache-name "${{ vars.REDIS_NAME }}" \
+              --engine valkey \
+              --major-engine-version 9 \
+              --security-group-ids "${{ vars.REDIS_SG_1 }}" "${{ vars.REDIS_SG_2 }}" \
+              --subnet-ids "${{ vars.REDIS_SUBNET_1 }}" "${{ vars.REDIS_SUBNET_2 }}" > /dev/null
+            echo "ElastiCache 생성 요청 완료, 활성화 대기 중..."
+            while true; do
+              sleep 15
+              REDIS_STATUS=$(aws elasticache describe-serverless-caches \
+                --serverless-cache-name "${{ vars.REDIS_NAME }}" \
+                --query "ServerlessCaches[0].Status" \
+                --output text)
+              echo "ElastiCache 상태: $REDIS_STATUS"
+              if [ "$REDIS_STATUS" = "available" ]; then
+                break
+              fi
+            done
+            echo "ElastiCache 생성 완료"
+            REDIS_HOST=$(aws elasticache describe-serverless-caches \
+              --serverless-cache-name "${{ vars.REDIS_NAME }}" \
+              --query "ServerlessCaches[0].Endpoint.Address" \
+              --output text)
           fi
+          echo "REDIS_HOST=$REDIS_HOST" >> $GITHUB_ENV
+          echo "ElastiCache 엔드포인트: $REDIS_HOST"
 
       - name: Target Group 생성
         run: |
@@ -163,6 +193,15 @@ jobs:
           fi
           echo "ALB_ARN=$ALB_ARN" >> $GITHUB_ENV
 
+      - name: ECS 태스크 정의 최신 버전 조회
+        run: |
+          TASK_DEF_ARN=$(aws ecs describe-task-definition \
+            --task-definition "${{ vars.TASK_DEF }}" \
+            --query "taskDefinition.taskDefinitionArn" \
+            --output text)
+          echo "ECS 태스크 정의: $TASK_DEF_ARN"
+          echo "TASK_DEF_ARN=$TASK_DEF_ARN" >> $GITHUB_ENV
+
       - name: ECS Service 시작
         run: |
           SVC_STATUS=$(aws ecs describe-services \
@@ -172,18 +211,19 @@ jobs:
             --output text 2>/dev/null || echo "")
 
           if [ "$SVC_STATUS" = "ACTIVE" ]; then
-            echo "ECS Service 이미 존재, desired-count 1로 설정 중..."
+            echo "ECS Service 이미 존재, 업데이트 중..."
             aws ecs update-service \
               --cluster "${{ vars.CLUSTER }}" \
               --service "${{ vars.SERVICE_NAME }}" \
-              --desired-count 1 > /dev/null
+              --desired-count ${{ vars.DESIRED_COUNT }} \
+              --task-definition "$TASK_DEF_ARN" > /dev/null
           else
             echo "ECS Service 생성 중..."
             aws ecs create-service \
               --cluster "${{ vars.CLUSTER }}" \
               --service-name "${{ vars.SERVICE_NAME }}" \
-              --task-definition "${{ vars.TASK_DEF }}" \
-              --desired-count 1 \
+              --task-definition "$TASK_DEF_ARN" \
+              --desired-count ${{ vars.DESIRED_COUNT }} \
               --capacity-provider-strategy "capacityProvider=FARGATE,weight=1,base=0" \
               --network-configuration "awsvpcConfiguration={subnets=[${{ vars.ECS_SUBNET_1 }},${{ vars.ECS_SUBNET_2 }}],securityGroups=[${{ vars.ECS_SG }}],assignPublicIp=DISABLED}" \
               --load-balancers "targetGroupArn=$TG_ARN,containerName=${{ vars.CONTAINER_NAME }},containerPort=${{ vars.CONTAINER_PORT }}" \
