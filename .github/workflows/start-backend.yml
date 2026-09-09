@@ -68,44 +68,34 @@ jobs:
 
       - name: ElastiCache 생성
         run: |
-          REDIS_STATUS=$(aws elasticache describe-serverless-caches \
-            --serverless-cache-name "${{ vars.REDIS_NAME }}" \
-            --query "ServerlessCaches[0].Status" \
-            --output text 2>/dev/null || echo "")
-          echo "ElastiCache 상태: $REDIS_STATUS"
+          while true; do
+            REDIS_STATUS=$(aws elasticache describe-serverless-caches \
+              --serverless-cache-name "${{ vars.REDIS_NAME }}" \
+              --query "ServerlessCaches[0].Status" \
+              --output text 2>/dev/null || echo "")
+            echo "ElastiCache 상태: $REDIS_STATUS"
 
-          if [ "$REDIS_STATUS" = "available" ]; then
-            echo "ElastiCache 이미 존재"
-            REDIS_HOST=$(aws elasticache describe-serverless-caches \
-              --serverless-cache-name "${{ vars.REDIS_NAME }}" \
-              --query "ServerlessCaches[0].Endpoint.Address" \
-              --output text)
-          else
-            echo "ElastiCache 생성 중..."
-            aws elasticache create-serverless-cache \
-              --serverless-cache-name "${{ vars.REDIS_NAME }}" \
-              --engine valkey \
-              --major-engine-version 9 \
-              --security-group-ids "${{ vars.REDIS_SG_1 }}" "${{ vars.REDIS_SG_2 }}" \
-              --subnet-ids "${{ vars.REDIS_SUBNET_1 }}" "${{ vars.REDIS_SUBNET_2 }}" > /dev/null
-            echo "ElastiCache 생성 요청 완료, 활성화 대기 중..."
-            while true; do
-              sleep 15
-              REDIS_STATUS=$(aws elasticache describe-serverless-caches \
+            if [ "$REDIS_STATUS" = "available" ]; then
+              echo "ElastiCache 이미 존재"
+              REDIS_HOST=$(aws elasticache describe-serverless-caches \
                 --serverless-cache-name "${{ vars.REDIS_NAME }}" \
-                --query "ServerlessCaches[0].Status" \
+                --query "ServerlessCaches[0].Endpoint.Address" \
                 --output text)
-              echo "ElastiCache 상태: $REDIS_STATUS"
-              if [ "$REDIS_STATUS" = "available" ]; then
-                break
-              fi
-            done
-            echo "ElastiCache 생성 완료"
-            REDIS_HOST=$(aws elasticache describe-serverless-caches \
-              --serverless-cache-name "${{ vars.REDIS_NAME }}" \
-              --query "ServerlessCaches[0].Endpoint.Address" \
-              --output text)
-          fi
+              break
+            elif [ -z "$REDIS_STATUS" ]; then
+              echo "ElastiCache 생성 중..."
+              aws elasticache create-serverless-cache \
+                --serverless-cache-name "${{ vars.REDIS_NAME }}" \
+                --engine valkey \
+                --major-engine-version 9 \
+                --security-group-ids "${{ vars.REDIS_SG_1 }}" "${{ vars.REDIS_SG_2 }}" \
+                --subnet-ids "${{ vars.REDIS_SUBNET_1 }}" "${{ vars.REDIS_SUBNET_2 }}" > /dev/null
+              echo "ElastiCache 생성 요청 완료, 활성화 대기 중..."
+            else
+              echo "ElastiCache 상태: $REDIS_STATUS, 대기 중..."
+              sleep 15
+            fi
+          done
           echo "REDIS_HOST=$REDIS_HOST" >> $GITHUB_ENV
           echo "ElastiCache 엔드포인트: $REDIS_HOST"
 
