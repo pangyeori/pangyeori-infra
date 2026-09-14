@@ -262,6 +262,14 @@ jobs:
           TIME=$(TZ="Asia/Seoul" date +"%Y-%m-%d %H:%M:%S KST")
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
+          BOT_NAME="${{ vars.DISCORD_BOT_NAME }}"
+          BOT_NAME="${BOT_NAME:-Pangyeori Infra Bot}"
+          AVATAR_URL="${{ vars.DISCORD_BOT_AVATAR_URL }}"
+          AVATAR_FIELD=""
+          if [ -n "$AVATAR_URL" ]; then
+            AVATAR_FIELD="\"avatar_url\": \"$AVATAR_URL\","
+          fi
+
           if [ "${{ needs.start.result }}" = "success" ]; then
             COLOR=3066993
             STATUS="✅ 성공"
@@ -274,6 +282,8 @@ jobs:
 
           curl -s -H "Content-Type: application/json" \
             -d "{
+              \"username\": \"$BOT_NAME\",
+              $AVATAR_FIELD
               \"embeds\": [{
                 \"title\": \"$STATUS | Backend Up\",
                 \"description\": \"$DESC\",
