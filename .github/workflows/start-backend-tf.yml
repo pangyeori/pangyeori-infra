@@ -1,0 +1,161 @@
+name: Start Backend (Terraform)
+
+on:
+  workflow_dispatch:
+
+# start/stop 이 겹치면 state 락 충돌과 NAT/RDS 상태 꼬임이 생기므로 하나씩만 실행한다.
+concurrency:
+  group: backend-toggle
+  cancel-in-progress: false
+
+jobs:
+  start:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ap-northeast-2
+      TF_VAR_state_bucket: ${{ vars.TF_STATE_BUCKET }}
+      TF_VAR_certificate_arn: ${{ secrets.CERT_ARN }}
+      TF_VAR_hosted_zone_id: ${{ secrets.HOSTED_ZONE_ID }}
+      TF_VAR_desired_count: ${{ vars.DESIRED_COUNT }}
+      TF_IN_AUTOMATION: "true"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # ---- Terraform이 다루지 못하는 부분: NAT 인스턴스 시작 + EIP, RDS 시작 ----
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.6"
+          terraform_wrapper: false
+
+      # NAT/RDS 식별자는 base 스택 출력에서 가져온다.
+      - name: base 스택 출력 조회 (NAT, RDS 식별자)
+        working-directory: terraform/base
+        run: |
+          terraform init -input=false -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+          echo "NAT_ID=$(terraform output -raw nat_instance_id)" >> $GITHUB_ENV
+          echo "RDS_ID=$(terraform output -raw rds_identifier)" >> $GITHUB_ENV
+
+      - name: NAT Instance 시작
+        run: |
+          while true; do
+            NAT_STATUS=$(aws ec2 describe-instances \
+              --instance-ids "$NAT_ID" \
+              --query "Reservations[0].Instances[0].State.Name" \
+              --output text)
+            echo "NAT Instance 상태: $NAT_STATUS"
+
+            if [ "$NAT_STATUS" = "running" ]; then
+              break
+            elif [ "$NAT_STATUS" = "stopped" ]; then
+              aws ec2 start-instances --instance-ids "$NAT_ID" > /dev/null
+              aws ec2 wait instance-running --instance-ids "$NAT_ID"
+
+              NAT_EIP_ALLOC=$(aws ec2 allocate-address --domain vpc --query "AllocationId" --output text)
+              aws ec2 associate-address --instance-id "$NAT_ID" --allocation-id "$NAT_EIP_ALLOC" > /dev/null
+              echo "Elastic IP 할당 완료"
+              sleep 20
+              break
+            else
+              sleep 15
+            fi
+          done
+
+      - name: RDS 시작
+        run: |
+          while true; do
+            RDS_STATUS=$(aws rds describe-db-instances \
+              --db-instance-identifier "$RDS_ID" \
+              --query "DBInstances[0].DBInstanceStatus" \
+              --output text)
+            echo "RDS 상태: $RDS_STATUS"
+
+            if [ "$RDS_STATUS" = "available" ]; then
+              break
+            elif [ "$RDS_STATUS" = "stopped" ]; then
+              aws rds start-db-instance --db-instance-identifier "$RDS_ID" > /dev/null
+              aws rds wait db-instance-available --db-instance-identifier "$RDS_ID"
+              echo "RDS 시작 완료"
+              break
+            else
+              sleep 15
+            fi
+          done
+
+      # ---- Terraform: ElastiCache, ALB, 타겟 그룹, 리스너, Route53, ECS 서비스 ----
+      - name: Terraform init
+        working-directory: terraform/compute
+        run: terraform init -input=false -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+
+      - name: Terraform apply (compute)
+        working-directory: terraform/compute
+        run: terraform apply -input=false -auto-approve
+
+      - name: ALB 헬스체크
+        working-directory: terraform/compute
+        run: |
+          TG_ARN=$(terraform output -raw target_group_arn)
+
+          for i in $(seq 1 60); do
+            HEALTH=$(aws elbv2 describe-target-health               --target-group-arn "$TG_ARN"               --query "TargetHealthDescriptions[0].TargetHealth.State"               --output text 2>/dev/null || echo "")
+
+            if [ "$HEALTH" = "healthy" ]; then
+              echo "ALB 헬스체크 통과 (현재 상태: healthy)"
+              exit 0
+            fi
+            echo "대기 중... (현재 상태: $HEALTH, $i/60)"
+            sleep 10
+          done
+
+          echo "10분 안에 타겟이 healthy 가 되지 않았습니다."
+          exit 1
+
+  notify:
+    needs: start
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Discord 알림
+        run: |
+          TIME=$(TZ="Asia/Seoul" date +"%Y-%m-%d %H:%M:%S KST")
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          BOT_NAME="${{ vars.DISCORD_BOT_NAME }}"
+          BOT_NAME="${BOT_NAME:-Pangyeori Infra Bot}"
+          AVATAR_URL="${{ vars.DISCORD_BOT_AVATAR_URL }}"
+          AVATAR_FIELD=""
+          if [ -n "$AVATAR_URL" ]; then
+            AVATAR_FIELD="\"avatar_url\": \"$AVATAR_URL\","
+          fi
+
+          if [ "${{ needs.start.result }}" = "success" ]; then
+            COLOR=3066993
+            STATUS="✅ 성공"
+            DESC="백엔드 서버가 정상적으로 시작됐습니다. (Terraform)"
+          else
+            COLOR=15158332
+            STATUS="❌ 실패"
+            DESC="백엔드 서버 시작에 실패했습니다. (Terraform)"
+          fi
+
+          curl -s -H "Content-Type: application/json" \
+            -d "{
+              \"username\": \"$BOT_NAME\",
+              $AVATAR_FIELD
+              \"embeds\": [{
+                \"title\": \"$STATUS | Backend Up (Terraform)\",
+                \"description\": \"$DESC\",
+                \"color\": $COLOR,
+                \"fields\": [
+                  {\"name\": \"실행자\", \"value\": \"${{ github.actor }}\", \"inline\": true},
+                  {\"name\": \"시간\", \"value\": \"$TIME\", \"inline\": true},
+                  {\"name\": \"로그\", \"value\": \"[Actions 실행 보기]($RUN_URL)\", \"inline\": false}
+                ]
+              }]
+            }" \
+            "${{ secrets.DISCORD_WEBHOOK_URL }}" || true
