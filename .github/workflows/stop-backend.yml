@@ -2,102 +2,69 @@ name: Stop Backend
 
 on:
   workflow_dispatch:
+    inputs:
+      stop_rds:
+        description: "RDS도 중지할지 여부 (false면 RDS 유지)"
+        type: boolean
+        default: true
+
+# start/stop 이 겹치면 state 락 충돌과 NAT/RDS 상태 꼬임이 생기므로 하나씩만 실행한다.
+concurrency:
+  group: backend-toggle
+  cancel-in-progress: false
 
 jobs:
   stop:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: ap-northeast-2
+      # destroy 에도 필수 변수 값이 필요하다.
+      TF_VAR_state_bucket: ${{ vars.TF_STATE_BUCKET }}
+      TF_VAR_certificate_arn: ${{ secrets.CERT_ARN }}
+      TF_VAR_hosted_zone_id: ${{ secrets.HOSTED_ZONE_ID }}
+      TF_IN_AUTOMATION: "true"
 
     steps:
-      - name: ECS Service 삭제
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # ---- Terraform: compute 삭제 (base 는 건드리지 않는다) ----
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.6"
+          terraform_wrapper: false
+
+      # NAT/RDS 식별자는 base 스택 출력에서 가져온다.
+      - name: base 스택 출력 조회 (NAT, RDS 식별자)
+        working-directory: terraform/base
         run: |
-          SVC_STATUS=$(aws ecs describe-services \
-            --cluster "${{ vars.CLUSTER }}" \
-            --services "${{ vars.SERVICE_NAME }}" \
-            --query "services[0].status" \
-            --output text 2>/dev/null || echo "")
+          terraform init -input=false -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+          echo "NAT_ID=$(terraform output -raw nat_instance_id)" >> $GITHUB_ENV
+          echo "RDS_ID=$(terraform output -raw rds_identifier)" >> $GITHUB_ENV
 
-          if [ "$SVC_STATUS" = "ACTIVE" ]; then
-            aws ecs update-service \
-              --cluster "${{ vars.CLUSTER }}" \
-              --service "${{ vars.SERVICE_NAME }}" \
-              --desired-count 0 > /dev/null
-            aws ecs wait services-stable \
-              --cluster "${{ vars.CLUSTER }}" \
-              --services "${{ vars.SERVICE_NAME }}"
-            aws ecs delete-service \
-              --cluster "${{ vars.CLUSTER }}" \
-              --service "${{ vars.SERVICE_NAME }}" > /dev/null
-            echo "ECS Service 삭제 완료"
-          else
-            echo "ECS Service 없음, 건너뜀"
-          fi
+      - name: Terraform init
+        working-directory: terraform/compute
+        run: terraform init -input=false -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
 
-      - name: ElastiCache 삭제
-        run: |
-          REDIS_STATUS=$(aws elasticache describe-serverless-caches \
-            --serverless-cache-name "${{ vars.REDIS_NAME }}" \
-            --query "ServerlessCaches[0].Status" \
-            --output text 2>/dev/null || echo "")
+      - name: Terraform destroy (compute)
+        working-directory: terraform/compute
+        run: terraform destroy -input=false -auto-approve
 
-          if [ "$REDIS_STATUS" = "available" ]; then
-            aws elasticache delete-serverless-cache \
-              --serverless-cache-name "${{ vars.REDIS_NAME }}" > /dev/null
-            echo "ElastiCache 삭제 완료"
-          else
-            echo "ElastiCache 없음, 건너뜀"
-          fi
-
-      - name: ALB 삭제
-        run: |
-          ALB_ARN=$(aws elbv2 describe-load-balancers \
-            --names "${{ vars.ALB_NAME }}" \
-            --query "LoadBalancers[0].LoadBalancerArn" \
-            --output text 2>/dev/null || echo "")
-
-          if [ -n "$ALB_ARN" ] && [ "$ALB_ARN" != "None" ]; then
-            LISTENERS=$(aws elbv2 describe-listeners \
-              --load-balancer-arn "$ALB_ARN" \
-              --query "Listeners[*].ListenerArn" \
-              --output text)
-            for L in $LISTENERS; do
-              aws elbv2 delete-listener --listener-arn "$L" > /dev/null
-            done
-            echo "ALB Listener 삭제 완료"
-
-            aws elbv2 delete-load-balancer --load-balancer-arn "$ALB_ARN" > /dev/null
-            aws elbv2 wait load-balancers-deleted --load-balancer-arns "$ALB_ARN"
-            echo "ALB 삭제 완료"
-          else
-            echo "ALB 없음, 건너뜀"
-          fi
-
-      - name: Target Group 삭제
-        run: |
-          TG_ARN=$(aws elbv2 describe-target-groups \
-            --names "${{ vars.TG_NAME }}" \
-            --query "TargetGroups[0].TargetGroupArn" \
-            --output text 2>/dev/null || echo "")
-
-          if [ -n "$TG_ARN" ] && [ "$TG_ARN" != "None" ]; then
-            aws elbv2 delete-target-group --target-group-arn "$TG_ARN" > /dev/null
-            echo "Target Group 삭제 완료"
-          else
-            echo "Target Group 없음, 건너뜀"
-          fi
-
+      # ---- Terraform이 다루지 못하는 부분: RDS 중지, NAT 인스턴스 중지 + EIP 반납 ----
       - name: RDS 중지
+        if: ${{ inputs.stop_rds }}
         run: |
           RDS_STATUS=$(aws rds describe-db-instances \
-            --db-instance-identifier "${{ vars.RDS_ID }}" \
+            --db-instance-identifier "$RDS_ID" \
             --query "DBInstances[0].DBInstanceStatus" \
             --output text)
 
           if [ "$RDS_STATUS" = "available" ]; then
-            aws rds stop-db-instance --db-instance-identifier "${{ vars.RDS_ID }}" > /dev/null
+            aws rds stop-db-instance --db-instance-identifier "$RDS_ID" > /dev/null
             echo "RDS 중지 완료"
           else
             echo "RDS 이미 중지 중, 건너뜀"
@@ -105,11 +72,6 @@ jobs:
 
       - name: NAT Instance 중지
         run: |
-          NAT_ID=$(aws ec2 describe-instances \
-            --filters "Name=tag:Name,Values=${{ vars.NAT_TAG }}" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
-            --query "Reservations[0].Instances[0].InstanceId" \
-            --output text)
-
           NAT_STATUS=$(aws ec2 describe-instances \
             --instance-ids "$NAT_ID" \
             --query "Reservations[0].Instances[0].State.Name" \
@@ -160,11 +122,11 @@ jobs:
           if [ "${{ needs.stop.result }}" = "success" ]; then
             COLOR=3066993
             STATUS="✅ 성공"
-            DESC="백엔드 서버가 정상적으로 중지됐습니다."
+            DESC="백엔드 서버가 정상적으로 중지됐습니다. (Terraform)"
           else
             COLOR=15158332
             STATUS="❌ 실패"
-            DESC="백엔드 서버 중지에 실패했습니다."
+            DESC="백엔드 서버 중지에 실패했습니다. (Terraform)"
           fi
 
           curl -s -H "Content-Type: application/json" \
@@ -172,7 +134,7 @@ jobs:
               \"username\": \"$BOT_NAME\",
               $AVATAR_FIELD
               \"embeds\": [{
-                \"title\": \"$STATUS | Backend Down\",
+                \"title\": \"$STATUS | Backend Down (Terraform)\",
                 \"description\": \"$DESC\",
                 \"color\": $COLOR,
                 \"fields\": [
