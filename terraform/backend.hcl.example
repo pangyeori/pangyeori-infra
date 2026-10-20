@@ -1,0 +1,2 @@
+# terraform/backend.hcl 로 복사해서 쓴다 (.gitignore 대상)
+bucket = "<state-bucket-name>"
