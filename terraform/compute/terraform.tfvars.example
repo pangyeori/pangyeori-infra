@@ -8,5 +8,3 @@ certificate_arn = "arn:aws:acm:ap-northeast-2:<ACCOUNT_ID>:certificate/<CERT_ID>
 
 # GitHub secret 의 HOSTED_ZONE_ID 값
 hosted_zone_id = "<ZONE_ID>"
-
-desired_count = 1
