@@ -28,7 +28,7 @@ jobs:
 
       # ---- Terraform이 다루지 못하는 부분: NAT 인스턴스 시작 + EIP, RDS 시작 ----
       - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+        uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: "1.16.6"
           terraform_wrapper: false

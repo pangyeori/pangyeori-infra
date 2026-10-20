@@ -33,7 +33,7 @@ jobs:
 
       # ---- Terraform: compute 삭제 (base 는 건드리지 않는다) ----
       - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+        uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: "1.16.6"
           terraform_wrapper: false
